@@ -129,7 +129,7 @@ async def test_commit_marker_is_set_during_commit_and_cleared_after(monkeypatch)
     session = await _armed_session(engine, "call-marker")
     observed = []
 
-    async def fake_inner(call_id, target_session=None, *, commit_marker=None):
+    async def fake_inner(call_id, target_session=None, *, commit_marker=None, expected_action_id=None):
         commit_marker["action_id"] = session.pending_deferred_transfer["id"]
         observed.append([dict(m) for m in engine._deferred_transfer_committing[call_id]])
         observed.append(engine._provider_audio_blocked_by_transfer_commit(call_id, session))
@@ -149,7 +149,7 @@ async def test_commit_marker_is_cleared_when_commit_raises(monkeypatch):
     engine = _build_engine()
     session = await _armed_session(engine, "call-marker-error")
 
-    async def failing_inner(call_id, target_session=None, *, commit_marker=None):
+    async def failing_inner(call_id, target_session=None, *, commit_marker=None, expected_action_id=None):
         commit_marker["action_id"] = session.pending_deferred_transfer["id"]
         assert len(engine._deferred_transfer_committing[call_id]) == 1
         raise RuntimeError("ari unavailable")
@@ -172,7 +172,7 @@ async def test_overlapping_commits_keep_marker_until_the_last_one_finishes(monke
     started = {"first": asyncio.Event(), "second": asyncio.Event()}
     order = iter(("first", "second"))
 
-    async def blocking_inner(target_call_id, target_session=None, *, commit_marker=None):
+    async def blocking_inner(target_call_id, target_session=None, *, commit_marker=None, expected_action_id=None):
         name = next(order)
         commit_marker["action_id"] = session.pending_deferred_transfer["id"]
         started[name].set()
@@ -303,4 +303,75 @@ async def test_repeated_handoff_turn_is_not_played_while_transfer_drains(monkeyp
     await asyncio.wait_for(asyncio.gather(*list(engine._call_bg_tasks[call_id])), timeout=1)
 
     assert committed == [call_id]
+    assert call_id not in engine._deferred_transfer_committing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiter_started", [False, True])
+async def test_old_queued_completion_preserves_replacement_handoff(monkeypatch, waiter_started):
+    """A completion for A must not take ownership of B after scheduling or locking."""
+    engine = _build_engine()
+    call_id = "call-queued-replacement"
+    session = await _armed_session(engine, call_id)
+    streams = _record_stream_starts(engine, monkeypatch)
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    drained_actions = []
+    committed_actions = []
+
+    async def no_local_handoff(*args, **kwargs):
+        return False
+
+    async def controlled_drain(target_call_id):
+        current = await engine.session_store.get_by_call_id(target_call_id)
+        drained_actions.append(current.pending_deferred_transfer["id"])
+        drain_started.set()
+        await release_drain.wait()
+        return True
+
+    async def fake_commit(context):
+        current = await engine.session_store.get_by_call_id(context.call_id)
+        committed_actions.append(current.pending_deferred_transfer["id"])
+        current.pending_deferred_transfer = None
+        await engine.session_store.upsert_call(current)
+        return {"status": "success"}
+
+    monkeypatch.setattr(engine, "_play_deferred_transfer_local_handoff", no_local_handoff)
+    monkeypatch.setattr(engine, "_wait_for_deferred_transfer_audio_drain", controlled_drain)
+    monkeypatch.setattr(
+        "src.tools.telephony.deferred_transfer.commit_pending_deferred_transfer", fake_commit,
+    )
+    done = {"type": "AgentAudioDone", "call_id": call_id, "streaming_done": True}
+
+    # A's handoff ends, then its repeated turn ends while the first commit drains.
+    await engine.on_provider_event(_agent_audio(call_id))
+    await engine.on_provider_event(done)
+    await asyncio.wait_for(drain_started.wait(), timeout=1)
+    await engine.on_provider_event(done)
+    if waiter_started:
+        await asyncio.sleep(0)  # The second attempt is now waiting on A's lock.
+
+    # Replace A before the queued callback runs, or while it waits on the lock.
+    session.pending_deferred_transfer = _pending_action("action-replacement")
+    await engine.session_store.upsert_call(session)
+    old_tasks = list(engine._call_bg_tasks[call_id])
+    release_drain.set()
+    await asyncio.wait_for(asyncio.gather(*old_tasks), timeout=1)
+
+    assert drained_actions == ["action-call-queued-replacement"]
+    assert committed_actions == []
+    assert session.pending_deferred_transfer["id"] == "action-replacement"
+    await engine.on_provider_event(_agent_audio(call_id))
+    assert len(streams) == 2
+    assert "transfer_commit_dropped" not in session.vad_state
+    assert call_id not in engine._deferred_transfer_committing
+
+    # B's own completion still owns its commit, exactly once.
+    await engine.on_provider_event(done)
+    await asyncio.wait_for(
+        asyncio.gather(*list(engine._call_bg_tasks[call_id])), timeout=1,
+    )
+    assert drained_actions == ["action-call-queued-replacement", "action-replacement"]
+    assert committed_actions == ["action-replacement"]
+    assert session.pending_deferred_transfer is None
     assert call_id not in engine._deferred_transfer_committing

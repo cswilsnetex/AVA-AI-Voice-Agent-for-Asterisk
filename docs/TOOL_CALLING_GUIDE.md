@@ -924,6 +924,19 @@ contexts:
 
 ### Enable Tools in config/ai-agent.yaml
 
+With deferred transfers enabled, the engine lets the handoff audio drain before
+committing the transfer. During that commit it drops new full-agent provider
+audio for the same pending transfer, preventing repeated handoff turns from
+playing or extending the wait. Completion callbacks stay bound to the transfer
+that triggered them: cancelled or replaced actions cannot start committing a
+replacement before its own handoff completes. Timeout recovery clears the
+pending transfer before requesting an apology, so the apology can play.
+Local handoff playback and modular pipeline transfer prompts bypass this gate.
+
+The provider can still generate the repeated turn, so its transcript may show
+the handoff twice. With opt-in Google Developer long-response playback, repeats
+queued before the commit begins can still be heard.
+
 ```yaml
 # ============================================================================
 # TOOL CALLING CONFIGURATION (v4.1+)
