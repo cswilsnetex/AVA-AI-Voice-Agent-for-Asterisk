@@ -318,6 +318,15 @@ async def test_old_queued_completion_preserves_replacement_handoff(monkeypatch, 
     release_drain = asyncio.Event()
     drained_actions = []
     committed_actions = []
+    waiter_queued = asyncio.Event()
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                waiter_queued.set()
+            return await super().acquire()
+
+    engine._deferred_transfer_commit_locks[call_id] = ObservedLock()
 
     async def no_local_handoff(*args, **kwargs):
         return False
@@ -349,7 +358,7 @@ async def test_old_queued_completion_preserves_replacement_handoff(monkeypatch, 
     await asyncio.wait_for(drain_started.wait(), timeout=1)
     await engine.on_provider_event(done)
     if waiter_started:
-        await asyncio.sleep(0)  # The second attempt is now waiting on A's lock.
+        await asyncio.wait_for(waiter_queued.wait(), timeout=1)
 
     # Replace A before the queued callback runs, or while it waits on the lock.
     session.pending_deferred_transfer = _pending_action("action-replacement")
